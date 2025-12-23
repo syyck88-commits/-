@@ -42,11 +42,11 @@ export const MathNode = ({ data, id }: any) => {
       </div>
       
       <div className="relative mb-4">
-        <Handle type="target" position={Position.Left} id="in-0" style={{ backgroundColor: accentColor }} />
+        <Handle type="target" position={Position.Left} id="in-0" style={{ backgroundColor: accentColor }} className="!-left-4" />
         <div className="text-center py-2 bg-zinc-800 rounded-lg font-mono text-lg font-bold" style={{ color: accentColor }}>
           {Math.round(data.values?.[0] || 0)}
         </div>
-        <Handle type="source" position={Position.Right} id="out-0" style={{ backgroundColor: accentColor }} />
+        <Handle type="source" position={Position.Right} id="out-0" style={{ backgroundColor: accentColor }} className="!-right-4" />
       </div>
 
       <div className="space-y-2">

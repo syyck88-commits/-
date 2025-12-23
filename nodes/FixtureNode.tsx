@@ -74,7 +74,7 @@ export const FixtureNode = ({ data, id }: any) => {
                 type="target"
                 position={Position.Left}
                 id={`in-${idx}`}
-                className="!w-2 !h-2"
+                className="!w-2 !h-2 !-left-4"
                 style={{ 
                   backgroundColor: chanColor,
                   borderColor: isStandardColor ? '#000' : `${chanColor}88`
@@ -114,7 +114,7 @@ export const FixtureNode = ({ data, id }: any) => {
                 type="source"
                 position={Position.Right}
                 id={`out-${idx}`}
-                className="!w-2 !h-2"
+                className="!w-2 !h-2 !-right-4"
                 style={{ 
                   backgroundColor: chanColor,
                   borderColor: isStandardColor ? '#000' : `${chanColor}88`

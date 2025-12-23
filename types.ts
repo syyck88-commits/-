@@ -67,3 +67,26 @@ export interface EdgeData {
 
 export type LuminaNode = Node<NodeData>;
 export type LuminaEdge = Edge<EdgeData>;
+
+// --- MIDI TYPES ---
+
+export type MidiMsgType = 'cc' | 'note';
+
+export interface MidiConfig {
+  channel: number; // 1-16
+  type: MidiMsgType;
+  index: number; // 0-127 (CC# or Note#)
+  mode: 'momentary' | 'toggle';
+  deviceId?: string; // Specific device ID or 'ALL'
+}
+
+// Key format: `${deviceId}__${channel}-${type}-${index}`
+export type MidiState = Record<string, number>;
+
+export interface MidiLearnEvent {
+  channel: number;
+  type: MidiMsgType;
+  index: number;
+  value: number;
+  deviceId: string;
+}

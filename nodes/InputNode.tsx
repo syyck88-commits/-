@@ -1,9 +1,8 @@
-
 import React, { useState, useRef, useEffect } from 'react';
 import { Handle, Position } from '@xyflow/react';
 
 export const InputNode = ({ data, id }: any) => {
-  const [mode, setMode] = useState<'media' | 'device'>('media');
+  const [mode, setMode] = useState<'media' | 'device' | 'system'>('media');
   const [isPlaying, setIsPlaying] = useState(false);
   const [fileName, setFileName] = useState<string | null>(null);
   const [progress, setProgress] = useState(0);
@@ -12,12 +11,20 @@ export const InputNode = ({ data, id }: any) => {
   
   const audioCtx = useRef<AudioContext | null>(null);
   const analyser = useRef<AnalyserNode | null>(null);
+  // Track the source node to disconnect
   const sourceNode = useRef<AudioBufferSourceNode | MediaStreamAudioSourceNode | null>(null);
+  // Track the active stream to stop tracks (turn off mic/screen icon)
+  const activeStream = useRef<MediaStream | null>(null);
   const audioBuffer = useRef<AudioBuffer | null>(null);
+  
   const startTime = useRef(0);
   const offsetTime = useRef(0);
   const animationFrame = useRef(0);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  
+  // Ref for the callback to keep the effect loop stable
+  const onUpdateRef = useRef(data.onAudioLevelsUpdate);
+  onUpdateRef.current = data.onAudioLevelsUpdate;
 
   const initAudio = async () => {
     if (!audioCtx.current) {
@@ -26,6 +33,25 @@ export const InputNode = ({ data, id }: any) => {
       analyser.current.fftSize = 256;
     }
     if (audioCtx.current.state === 'suspended') await audioCtx.current.resume();
+  };
+
+  const cleanupCurrentSource = () => {
+    if (sourceNode.current) {
+      try {
+        if ('stop' in sourceNode.current) {
+          (sourceNode.current as AudioBufferSourceNode).stop();
+        }
+        sourceNode.current.disconnect();
+      } catch (e) { /* ignore already stopped */ }
+      sourceNode.current = null;
+    }
+    
+    if (activeStream.current) {
+      activeStream.current.getTracks().forEach(t => t.stop());
+      activeStream.current = null;
+    }
+
+    setIsPlaying(false);
   };
 
   const getDevices = async () => {
@@ -37,14 +63,8 @@ export const InputNode = ({ data, id }: any) => {
   };
 
   const playBuffer = (buffer: AudioBuffer, fromTime: number) => {
-    if (sourceNode.current) {
-      try { 
-        if ('stop' in sourceNode.current) {
-          (sourceNode.current as AudioBufferSourceNode).stop();
-        }
-        sourceNode.current.disconnect(); 
-      } catch(e) {}
-    }
+    cleanupCurrentSource();
+    
     sourceNode.current = audioCtx.current!.createBufferSource();
     (sourceNode.current as AudioBufferSourceNode).buffer = buffer;
     sourceNode.current.connect(analyser.current!);
@@ -73,10 +93,7 @@ export const InputNode = ({ data, id }: any) => {
     if (!audioBuffer.current) return;
     if (isPlaying) {
       offsetTime.current = audioCtx.current!.currentTime - startTime.current;
-      if (sourceNode.current && 'stop' in sourceNode.current) {
-        (sourceNode.current as AudioBufferSourceNode).stop();
-      }
-      setIsPlaying(false);
+      cleanupCurrentSource();
     } else {
       playBuffer(audioBuffer.current, offsetTime.current);
     }
@@ -90,15 +107,64 @@ export const InputNode = ({ data, id }: any) => {
     else setProgress((seekTime / audioBuffer.current.duration) * 100);
   };
 
-  const startStream = async (deviceId: string) => {
+  const startMicStream = async (deviceId: string) => {
     await initAudio();
-    if (sourceNode.current) { sourceNode.current.disconnect(); }
+    cleanupCurrentSource();
+    
     const stream = await navigator.mediaDevices.getUserMedia({ 
       audio: { deviceId: deviceId ? { exact: deviceId } : undefined } 
     });
+    
+    activeStream.current = stream;
     sourceNode.current = audioCtx.current!.createMediaStreamSource(stream);
     sourceNode.current.connect(analyser.current!);
     setIsPlaying(true);
+  };
+
+  const startSystemStream = async () => {
+    // 1. Trigger getDisplayMedia immediately to satisfy User Activation requirements.
+    // This often fails if placed after other await calls (like initAudio) in some strict browsers.
+    try {
+      // We request video: true to trigger the screen picker, as audio-only is not supported
+      // by getDisplayMedia spec in most browsers. We will discard video immediately.
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        audio: true,
+        video: true 
+      });
+
+      // 2. Now init audio context (which also usually requires user gesture, but if it was already created it's fine)
+      await initAudio();
+      cleanupCurrentSource();
+
+      // Check if user shared audio
+      if (stream.getAudioTracks().length === 0) {
+        alert("No audio track detected. Please check 'Share tab audio' in the browser dialog.");
+        stream.getTracks().forEach(t => t.stop());
+        return;
+      }
+
+      // Stop video immediately - we only want audio and don't want to waste resources
+      stream.getVideoTracks().forEach(t => t.stop());
+      
+      activeStream.current = stream;
+      sourceNode.current = audioCtx.current!.createMediaStreamSource(stream);
+      sourceNode.current.connect(analyser.current!);
+
+      // If user clicks "Stop Sharing" in browser UI
+      stream.getAudioTracks()[0].onended = () => {
+        setIsPlaying(false);
+      };
+
+      setIsPlaying(true);
+    } catch (err) {
+      console.error("System capture error:", err);
+      // In case of permission policy error, usually external iframe/server config is needed.
+      if (err instanceof DOMException && err.name === 'NotAllowedError') {
+         alert("Screen capture was cancelled or not allowed.");
+      } else {
+         console.warn("Ensure 'display-capture' permission is allowed in your environment.");
+      }
+    }
   };
 
   useEffect(() => {
@@ -138,8 +204,8 @@ export const InputNode = ({ data, id }: any) => {
       for (let i = lowRange; i < midRange; i++) mid += dataArray[i];
       for (let i = midRange; i < binCount; i++) high += dataArray[i];
 
-      if (data.onAudioLevelsUpdate) {
-        data.onAudioLevelsUpdate(id, {
+      if (onUpdateRef.current) {
+        onUpdateRef.current(id, {
           low: low / Math.max(1, lowRange),
           mid: mid / Math.max(1, midRange - lowRange),
           high: high / Math.max(1, binCount - midRange)
@@ -149,33 +215,57 @@ export const InputNode = ({ data, id }: any) => {
       animationFrame.current = requestAnimationFrame(tick);
     };
     tick();
-    return () => cancelAnimationFrame(animationFrame.current);
-  }, [id, data, mode, isPlaying]);
+    
+    return () => {
+        cancelAnimationFrame(animationFrame.current);
+    };
+  }, [id, mode, isPlaying]);
+
+  useEffect(() => {
+    return () => {
+        cleanupCurrentSource();
+        if (audioCtx.current && audioCtx.current.state !== 'closed') {
+            audioCtx.current.close();
+        }
+    };
+  }, []);
 
   return (
     <div className="bg-[#121216] border border-zinc-800 rounded-2xl p-4 w-72 relative h-full">
-      <div className="flex gap-2 mb-4 bg-zinc-900/50 p-1 rounded-xl">
+      <div className="flex gap-1 mb-4 bg-zinc-900/50 p-1 rounded-xl">
         <button 
-          onClick={() => setMode('media')} 
-          className={`flex-1 py-1.5 rounded-lg text-[9px] font-black uppercase tracking-widest transition-all ${mode === 'media' ? 'bg-emerald-500 text-white' : 'text-zinc-600 hover:text-white'}`}
+          onClick={() => { setMode('media'); cleanupCurrentSource(); }} 
+          className={`flex-1 py-1.5 rounded-lg text-[8px] font-black uppercase tracking-widest transition-all ${mode === 'media' ? 'bg-emerald-500 text-white' : 'text-zinc-600 hover:text-white'}`}
         >Media</button>
         <button 
-          onClick={() => { setMode('device'); getDevices(); }} 
-          className={`flex-1 py-1.5 rounded-lg text-[9px] font-black uppercase tracking-widest transition-all ${mode === 'device' ? 'bg-emerald-500 text-white' : 'text-zinc-600 hover:text-white'}`}
+          onClick={() => { setMode('device'); cleanupCurrentSource(); getDevices(); }} 
+          className={`flex-1 py-1.5 rounded-lg text-[8px] font-black uppercase tracking-widest transition-all ${mode === 'device' ? 'bg-emerald-500 text-white' : 'text-zinc-600 hover:text-white'}`}
         >Device</button>
+        <button 
+          onClick={() => { setMode('system'); cleanupCurrentSource(); }} 
+          className={`flex-1 py-1.5 rounded-lg text-[8px] font-black uppercase tracking-widest transition-all ${mode === 'system' ? 'bg-emerald-500 text-white' : 'text-zinc-600 hover:text-white'}`}
+        >System</button>
       </div>
 
       <div className="relative mb-4 h-24 bg-black rounded-xl overflow-hidden border border-zinc-900">
         <canvas ref={canvasRef} width={280} height={96} className="w-full h-full opacity-60" />
         {mode === 'media' && !fileName && (
-          <div className="absolute inset-0 flex flex-col items-center justify-center border-2 border-dashed border-zinc-900/50 rounded-xl m-1.5">
+          <div className="absolute inset-0 flex flex-col items-center justify-center border-2 border-dashed border-zinc-900/50 rounded-xl m-1.5 pointer-events-none">
             <span className="text-[7px] font-black text-zinc-700 uppercase">Drop Audio File</span>
-            <input 
+          </div>
+        )}
+        {mode === 'media' && !fileName && (
+           <input 
               type="file" accept="audio/*,video/*" 
               onChange={e => e.target.files?.[0] && handleFile(e.target.files[0])}
               className="absolute inset-0 opacity-0 cursor-pointer"
             />
-          </div>
+        )}
+        {(mode === 'device' || mode === 'system') && isPlaying && (
+            <div className="absolute top-2 right-2 flex items-center gap-1.5 bg-black/50 px-2 py-1 rounded-full backdrop-blur-sm">
+                <div className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
+                <span className="text-[7px] font-black text-white uppercase tracking-wider">LIVE</span>
+            </div>
         )}
       </div>
 
@@ -204,7 +294,7 @@ export const InputNode = ({ data, id }: any) => {
             <span className="text-[7px] font-black text-zinc-600 uppercase">Input Device</span>
             <select 
               value={selectedDevice}
-              onChange={e => { setSelectedDevice(e.target.value); startStream(e.target.value); }}
+              onChange={e => { setSelectedDevice(e.target.value); startMicStream(e.target.value); }}
               className="bg-zinc-900 text-[9px] font-bold text-emerald-400 p-2 rounded-lg outline-none border border-zinc-800"
             >
               <option value="">Select Device...</option>
@@ -215,9 +305,25 @@ export const InputNode = ({ data, id }: any) => {
         </div>
       )}
 
-      <div className="mt-4 pt-3 border-t border-zinc-800/50 flex justify-between items-center">
+      {mode === 'system' && (
+        <div className="space-y-3">
+            <div className="px-1">
+                <p className="text-[8px] text-zinc-500 leading-3 mb-3">
+                    Capture system audio from a screen or tab. Select the window where audio is playing (e.g. YouTube).
+                </p>
+                <button 
+                    onClick={startSystemStream}
+                    className={`w-full py-2 rounded-xl text-[9px] font-black uppercase tracking-widest transition-all border ${isPlaying ? 'bg-red-500/10 border-red-500/50 text-red-500' : 'bg-emerald-500/10 border-emerald-500/20 text-emerald-500 hover:bg-emerald-500 hover:text-white'}`}
+                >
+                    {isPlaying ? 'Stop Capture' : 'Start Screen Capture'}
+                </button>
+            </div>
+        </div>
+      )}
+
+      <div className="mt-4 pt-3 border-t border-zinc-800/50 flex justify-between items-center relative">
         <span className="text-[8px] font-black text-zinc-600 uppercase tracking-widest">Signal Output</span>
-        <Handle type="source" position={Position.Right} id="signal-out" className="!bg-emerald-500 !w-3 !h-3 !border-[#121216] !-right-[18px]" />
+        <Handle type="source" position={Position.Right} id="signal-out" className="!bg-emerald-500 !w-3 !h-3 !border-[#121216] !-right-4" />
       </div>
     </div>
   );
