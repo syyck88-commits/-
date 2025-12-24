@@ -1,3 +1,4 @@
+
 import React, { useState, useRef, useEffect } from 'react';
 import { Handle, Position } from '@xyflow/react';
 
@@ -22,7 +23,7 @@ export const InputNode = ({ data, id }: any) => {
   const animationFrame = useRef(0);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   
-  // Ref for the callback to keep the effect loop stable
+  // Ref for the callback to keep the effect loop stable and accessible by the worker callback
   const onUpdateRef = useRef(data.onAudioLevelsUpdate);
   onUpdateRef.current = data.onAudioLevelsUpdate;
 
@@ -122,35 +123,27 @@ export const InputNode = ({ data, id }: any) => {
   };
 
   const startSystemStream = async () => {
-    // 1. Trigger getDisplayMedia immediately to satisfy User Activation requirements.
-    // This often fails if placed after other await calls (like initAudio) in some strict browsers.
     try {
-      // We request video: true to trigger the screen picker, as audio-only is not supported
-      // by getDisplayMedia spec in most browsers. We will discard video immediately.
       const stream = await navigator.mediaDevices.getDisplayMedia({
         audio: true,
         video: true 
       });
 
-      // 2. Now init audio context (which also usually requires user gesture, but if it was already created it's fine)
       await initAudio();
       cleanupCurrentSource();
 
-      // Check if user shared audio
       if (stream.getAudioTracks().length === 0) {
         alert("No audio track detected. Please check 'Share tab audio' in the browser dialog.");
         stream.getTracks().forEach(t => t.stop());
         return;
       }
 
-      // Stop video immediately - we only want audio and don't want to waste resources
       stream.getVideoTracks().forEach(t => t.stop());
       
       activeStream.current = stream;
       sourceNode.current = audioCtx.current!.createMediaStreamSource(stream);
       sourceNode.current.connect(analyser.current!);
 
-      // If user clicks "Stop Sharing" in browser UI
       stream.getAudioTracks()[0].onended = () => {
         setIsPlaying(false);
       };
@@ -158,7 +151,6 @@ export const InputNode = ({ data, id }: any) => {
       setIsPlaying(true);
     } catch (err) {
       console.error("System capture error:", err);
-      // In case of permission policy error, usually external iframe/server config is needed.
       if (err instanceof DOMException && err.name === 'NotAllowedError') {
          alert("Screen capture was cancelled or not allowed.");
       } else {
@@ -168,38 +160,33 @@ export const InputNode = ({ data, id }: any) => {
   };
 
   useEffect(() => {
-    const tick = () => {
-      if (!analyser.current) {
-        animationFrame.current = requestAnimationFrame(tick);
-        return;
-      }
+    // 1. Worker for ROBUST TIMING (Prevents background throttling)
+    // We run the data analysis tick in a worker interval, which stays active even when tab is hidden.
+    const blob = new Blob([`
+      let timer = null;
+      self.onmessage = function(e) {
+        if (e.data === 'start') {
+          timer = setInterval(() => self.postMessage('tick'), 30); // ~33fps update rate
+        } else if (e.data === 'stop') {
+          clearInterval(timer);
+        }
+      };
+    `], { type: 'application/javascript' });
+
+    const worker = new Worker(URL.createObjectURL(blob));
+
+    // When worker ticks, we process audio data
+    worker.onmessage = () => {
+      if (!analyser.current) return;
 
       const dataArray = new Uint8Array(analyser.current.frequencyBinCount);
       analyser.current.getByteFrequencyData(dataArray);
-
-      const canvas = canvasRef.current;
-      if (canvas) {
-        const ctx = canvas.getContext('2d');
-        if (ctx) {
-          ctx.clearRect(0, 0, canvas.width, canvas.height);
-          const barWidth = canvas.width / dataArray.length;
-          dataArray.forEach((val, i) => {
-            const h = (val / 255) * canvas.height;
-            ctx.fillStyle = `rgba(16, 185, 129, ${0.3 + (val/255)*0.7})`;
-            ctx.fillRect(i * barWidth, canvas.height - h, barWidth - 1, h);
-          });
-        }
-      }
-
-      if (mode === 'media' && isPlaying && audioBuffer.current) {
-        const current = audioCtx.current!.currentTime - startTime.current;
-        setProgress((current / audioBuffer.current.duration) * 100);
-      }
 
       let low = 0, mid = 0, high = 0;
       const binCount = dataArray.length;
       const lowRange = Math.floor(binCount * 0.1);
       const midRange = Math.floor(binCount * 0.5);
+      
       for (let i = 0; i < lowRange; i++) low += dataArray[i];
       for (let i = lowRange; i < midRange; i++) mid += dataArray[i];
       for (let i = midRange; i < binCount; i++) high += dataArray[i];
@@ -211,12 +198,42 @@ export const InputNode = ({ data, id }: any) => {
           high: high / Math.max(1, binCount - midRange)
         });
       }
-
-      animationFrame.current = requestAnimationFrame(tick);
     };
-    tick();
+
+    worker.postMessage('start');
+
+    // 2. Animation Loop for UI (Canvas Drawing)
+    // This uses requestAnimationFrame and MAY pause when backgrounded, which is fine for UI.
+    const draw = () => {
+      if (analyser.current && canvasRef.current) {
+        const dataArray = new Uint8Array(analyser.current.frequencyBinCount);
+        analyser.current.getByteFrequencyData(dataArray);
+
+        const ctx = canvasRef.current.getContext('2d');
+        if (ctx) {
+          ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+          const barWidth = canvasRef.current.width / dataArray.length;
+          dataArray.forEach((val, i) => {
+            const h = (val / 255) * canvasRef.current!.height;
+            ctx.fillStyle = `rgba(16, 185, 129, ${0.3 + (val/255)*0.7})`;
+            ctx.fillRect(i * barWidth, canvasRef.current!.height - h, barWidth - 1, h);
+          });
+        }
+      }
+
+      // Update progress slider
+      if (mode === 'media' && isPlaying && audioBuffer.current) {
+        const current = audioCtx.current!.currentTime - startTime.current;
+        setProgress((current / audioBuffer.current.duration) * 100);
+      }
+
+      animationFrame.current = requestAnimationFrame(draw);
+    };
+
+    draw();
     
     return () => {
+        worker.terminate();
         cancelAnimationFrame(animationFrame.current);
     };
   }, [id, mode, isPlaying]);
